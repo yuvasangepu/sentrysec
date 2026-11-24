@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""
+SentrySec - CCTV/DVR Vulnerability Assessment Toolkit
+=========================================================
+FOR USE ONLY ON DEVICES YOU OWN OR HAVE WRITTEN AUTHORIZATION TO TEST.
+
+This tool:
+  1. Discovers devices on a subnet exposing common CCTV/DVR ports
+  2. Fingerprints likely brand via HTTP banner
+  3. Checks for unauthenticated RTSP streams
+  4. Tests a small list of well-known FACTORY DEFAULT credentials
+  5. Generates an HTML vulnerability report
+
+It does NOT brute-force, does NOT exploit vulnerabilities, and does NOT
+attempt to bypass authentication beyond checking documented defaults.
+"""
+
+import sys
+import socket
+import json
+import datetime
+import ipaddress
+import hashlib
+import os
+import requests
+from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+
+try:
+    from hardware_alert_bridge import HardwareBridge
+    HARDWARE_AVAILABLE = True
+except ImportError:
+    HARDWARE_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+# Common ports used by CCTV/DVR/NVR systems
+CAMERA_PORTS = {
+    80: "HTTP Admin",
+    8080: "HTTP Admin (alt)",
+    554: "RTSP Stream",
+    8000: "Hikvision/CP Plus service",
+    9000: "Hikvision alt",
+    37777: "Dahua service",
+    34567: "Generic DVR (China OEM)",
+}
+
+# Small, well-documented factory-default credential list.
+# These are all PUBLICLY PUBLISHED default credentials from vendor manuals.
+DEFAULT_CREDS = [
+    ("admin", "admin"),
+    ("admin", "12345"),
+    ("admin", "123456"),
+    ("admin", ""),
+    ("admin", "888888"),
+    ("admin", "admin123"),
+    ("root", "root"),
+    ("root", "12345"),
+    ("user", "user"),
+]
+
+REQUEST_TIMEOUT = 2
+CVE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cve_database.json")
+AUDIT_LOG_PATH = "sentrysec_audit_log.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# AUTHORIZATION GATE - do not remove
+# ---------------------------------------------------------------------------
+
+def confirm_authorization():
+    print("=" * 60)
+    print("SentrySec - CCTV/DVR Vulnerability Scanner")
+    print("=" * 60)
+    print("\nThis tool must ONLY be run against:")
+    print("  - Devices you personally own, OR")
+    print("  - Systems you have explicit written authorization to test\n")
+    ans = input("Do you confirm you are authorized to scan the target "
+                "range you're about to enter? (yes/no): ").strip().lower()
+    if ans != "yes":
+        print("Authorization not confirmed. Exiting.")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# AUDIT LOG - forensic-style, tamper-evident action log
+# ---------------------------------------------------------------------------
+
+_last_entry_hash = "0" * 64  # genesis hash for this run's chain
+
+
+def audit_log(action, details=None):
+    """
+    Appends a timestamped, hash-chained entry to the audit log.
+    Each entry's hash includes the previous entry's hash, so any
+    tampering with an earlier line breaks the chain - same principle
+    used in chain-of-custody logging.
+    """
+    global _last_entry_hash
+    entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "action": action,
+        "details": details or {},
+        "prev_hash": _last_entry_hash,
+    }
+    entry_str = json.dumps(entry, sort_keys=True)
+    entry_hash = hashlib.sha256(entry_str.encode()).hexdigest()
+    entry["entry_hash"] = entry_hash
+    _last_entry_hash = entry_hash
+
+    with open(AUDIT_LOG_PATH, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+    return entry_hash
+
+
+def verify_audit_log(path=AUDIT_LOG_PATH):
+    """Re-walks the audit log and verifies the hash chain is unbroken."""
+    if not os.path.exists(path):
+        print("[!] No audit log found.")
+        return False
+
+    prev_hash = "0" * 64
+    with open(path) as f:
+        for i, line in enumerate(f, 1):
+            entry = json.loads(line)
+            claimed_hash = entry.pop("entry_hash")
+            entry_str = json.dumps(entry, sort_keys=True)
+            recomputed = hashlib.sha256(entry_str.encode()).hexdigest()
+            if entry["prev_hash"] != prev_hash or recomputed != claimed_hash:
+                print(f"[!] Audit log chain broken at entry {i}")
+                return False
+            prev_hash = claimed_hash
+    print(f"[*] Audit log verified: {i} entries, chain intact.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 1. DISCOVERY
+# ---------------------------------------------------------------------------
+
+def scan_port(ip, port, timeout=0.6):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            result = s.connect_ex((str(ip), port))
+            return result == 0
+    except socket.error:
+        return False
+
+
+def discover_devices(subnet):
+    """Scan a subnet (e.g. 192.168.1.0/24) for hosts with open CCTV/DVR ports."""
+    print(f"\n[*] Scanning {subnet} for CCTV/DVR-related open ports...")
+    net = ipaddress.ip_network(subnet, strict=False)
+    found = {}
+
+    for ip in net.hosts():
+        open_ports = []
+        for port in CAMERA_PORTS:
+            if scan_port(ip, port):
+                open_ports.append(port)
+        if open_ports:
+            found[str(ip)] = open_ports
+            print(f"    [+] {ip} -> open ports: {open_ports}")
+
+    if not found:
+        print("    [-] No CCTV/DVR-like devices found on this subnet.")
+    return found
+
+
+# ---------------------------------------------------------------------------
+# 2. FINGERPRINT
+# ---------------------------------------------------------------------------
+
+def fingerprint_device(ip, open_ports):
+    """Grab HTTP headers/banners to guess device brand."""
+    info = {"ip": ip, "open_ports": open_ports, "brand_guess": "Unknown", "server_header": None}
+
+    for port in (80, 8080, 8000, 9000):
+        if port not in open_ports:
+            continue
+        for scheme in ("http", "https"):
+            url = f"{scheme}://{ip}:{port}/"
+            try:
+                r = requests.get(url, timeout=REQUEST_TIMEOUT, verify=False)
+                server = r.headers.get("Server", "")
+                info["server_header"] = server
+                body_snippet = r.text[:300].lower()
+
+                if "hikvision" in server.lower() or "hikvision" in body_snippet:
+                    info["brand_guess"] = "Hikvision"
+                elif "dahua" in server.lower() or "dahua" in body_snippet:
+                    info["brand_guess"] = "Dahua"
+                elif "dvr" in body_snippet or "nvr" in body_snippet:
+                    info["brand_guess"] = "Generic DVR/NVR"
+                break
+            except requests.RequestException:
+                continue
+    return info
+
+
+# ---------------------------------------------------------------------------
+# 3. RTSP UNAUTHENTICATED STREAM CHECK
+# ---------------------------------------------------------------------------
+
+def check_rtsp_open(ip, port=554):
+    """
+    Attempts a minimal RTSP OPTIONS/DESCRIBE handshake to see if the server
+    responds without requiring authentication. Does not pull video.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(REQUEST_TIMEOUT)
+            s.connect((ip, port))
+            req = (f"OPTIONS rtsp://{ip}:{port}/ RTSP/1.0\r\n"
+                   f"CSeq: 1\r\n\r\n")
+            s.sendall(req.encode())
+            resp = s.recv(1024).decode(errors="ignore")
+            if "200 OK" in resp:
+                return True  # responded without auth challenge
+            if "401" in resp:
+                return False  # auth required - good
+            return None  # inconclusive
+    except socket.error:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 4. DEFAULT CREDENTIAL CHECK (HTTP admin panel only)
+# ---------------------------------------------------------------------------
+
+def check_default_creds(ip, open_ports):
+    """
+    Tries a short list of PUBLICLY DOCUMENTED factory-default credentials
+    against the device's HTTP admin login (Basic/Digest auth only).
+    Does NOT brute force - stops after the fixed list is exhausted.
+    """
+    results = []
+    admin_ports = [p for p in (80, 8080, 8000, 9000) if p in open_ports]
+
+    for port in admin_ports:
+        url = f"http://{ip}:{port}/"
+        for username, password in DEFAULT_CREDS:
+            try:
+                r = requests.get(url, auth=HTTPBasicAuth(username, password),
+                                  timeout=REQUEST_TIMEOUT)
+                if r.status_code == 200:
+                    results.append({"port": port, "username": username,
+                                     "password": password, "auth_type": "Basic"})
+                    break  # stop after first success on this port
+                r2 = requests.get(url, auth=HTTPDigestAuth(username, password),
+                                   timeout=REQUEST_TIMEOUT)
+                if r2.status_code == 200:
+                    results.append({"port": port, "username": username,
+                                     "password": password, "auth_type": "Digest"})
+                    break
+            except requests.RequestException:
+                continue
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 5. CVE MATCHING
+# ---------------------------------------------------------------------------
+
+def load_cve_database(path=CVE_DB_PATH):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print("[!] CVE database not found or invalid - skipping CVE matching.")
+        return {}
+
+
+def match_cves(brand_guess, cve_db):
+    """Return known public CVEs associated with the fingerprinted brand."""
+    return cve_db.get(brand_guess, [])
+
+
+# ---------------------------------------------------------------------------
+# 6. RISK SCORING (CVSS-informed, simplified)
+# ---------------------------------------------------------------------------
+
+def compute_risk_score(default_creds_found, rtsp_open, matched_cves):
+    """
+    Combines findings into a single 0-10 risk score using the highest
+    CVSS-equivalent severity among:
+      - default credentials working  -> 9.8 (matches real CVSS for this class)
+      - unauthenticated RTSP stream  -> 7.5
+      - matched known CVEs           -> each CVE's own published score
+    The overall score is the MAX of these (standard practice: report
+    the worst single issue, not an average).
+    """
+    scores = []
+    if default_creds_found:
+        scores.append(9.8)
+    if rtsp_open is True:
+        scores.append(7.5)
+    for cve in matched_cves:
+        scores.append(cve.get("cvss_score", 5.0))
+
+    if not scores:
+        return 0.0
+
+    return max(scores)
+
+
+def risk_label(score):
+    if score >= 9.0:
+        return "CRITICAL"
+    elif score >= 7.0:
+        return "HIGH"
+    elif score >= 4.0:
+        return "MEDIUM"
+    elif score > 0:
+        return "LOW"
+    return "NONE"
+
+
+# ---------------------------------------------------------------------------
+# 7. REPORT GENERATION
+# ---------------------------------------------------------------------------
+
+def generate_report(findings, output_path="sentrysec_report.html"):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = ""
+
+    for ip, data in findings.items():
+        creds = data.get("default_creds_found", [])
+        cred_str = "<br>".join(
+            f"{c['username']}:{c['password']} ({c['auth_type']}, port {c['port']})"
+            for c in creds
+        ) if creds else "None found"
+
+        rtsp_status = data.get("rtsp_open")
+        if rtsp_status is True:
+            rtsp_str = '<span style="color:red;font-weight:bold;">UNAUTHENTICATED</span>'
+        elif rtsp_status is False:
+            rtsp_str = '<span style="color:green;">Auth required</span>'
+        else:
+            rtsp_str = "Not tested / inconclusive"
+
+        matched_cves = data.get("matched_cves", [])
+        cve_str = "<br>".join(
+            f"{c['cve_id']} (CVSS {c['cvss_score']})" for c in matched_cves
+        ) if matched_cves else "None matched"
+
+        score = data.get("risk_score", 0.0)
+        risk = risk_label(score)
+        risk_colors = {"CRITICAL": "#ff1744", "HIGH": "red", "MEDIUM": "orange",
+                        "LOW": "#4CAF50", "NONE": "#4CAF50"}
+        risk_color = risk_colors.get(risk, "#4CAF50")
+
+        rows += f"""
+        <tr>
+            <td>{ip}</td>
+            <td>{data.get('brand_guess', 'Unknown')}</td>
+            <td>{data.get('open_ports')}</td>
+            <td>{cred_str}</td>
+            <td>{rtsp_str}</td>
+            <td>{cve_str}</td>
+            <td style="color:{risk_color};font-weight:bold;">{risk} ({score})</td>
+        </tr>
+        """
+
+    html = f"""
+    <html><head><title>SentrySec Report</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; background:#111; color:#eee; }}
+        h1 {{ color: #4CAF50; }}
+        table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
+        th, td {{ border: 1px solid #444; padding: 10px; text-align: left; }}
+        th {{ background-color: #222; }}
+        tr:nth-child(even) {{ background-color: #1a1a1a; }}
+    </style></head>
+    <body>
+        <h1>SentrySec Vulnerability Report</h1>
+        <p>Generated: {timestamp}</p>
+        <p><b>Scope:</b> Authorized lab/owned devices only</p>
+        <table>
+            <tr>
+                <th>IP</th><th>Brand Guess</th><th>Open Ports</th>
+                <th>Default Creds Found</th><th>RTSP Stream Auth</th>
+                <th>Matched CVEs</th><th>Risk Score</th>
+            </tr>
+            {rows}
+        </table>
+    </body></html>
+    """
+
+    with open(output_path, "w") as f:
+        f.write(html)
+    print(f"\n[*] Report written to {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+def main():
+    confirm_authorization()
+    audit_log("session_start")
+
+    subnet = input("\nEnter target subnet (e.g. 192.168.1.0/24): ").strip()
+    audit_log("authorization_confirmed", {"subnet": subnet})
+
+    bridge = None
+    if HARDWARE_AVAILABLE:
+        use_hw = input("Connect ESP32 hardware alert module? (y/n): ").strip().lower()
+        if use_hw == "y":
+            hw_port = input("Enter serial port (e.g. COM5 or /dev/ttyUSB0): ").strip()
+            bridge = HardwareBridge(hw_port)
+
+    cve_db = load_cve_database()
+
+    if bridge:
+        bridge.send_status("Scanning...")
+    devices = discover_devices(subnet)
+    audit_log("discovery_complete", {"devices_found": list(devices.keys())})
+
+    if not devices:
+        audit_log("session_end", {"reason": "no devices found"})
+        if bridge:
+            bridge.send_status("No devices")
+            bridge.close()
+        return
+
+    findings = {}
+    highest_score_seen = 0.0
+
+    for ip, ports in devices.items():
+        print(f"\n[*] Assessing {ip} ...")
+        if bridge:
+            bridge.send_status(f"Checking {ip}")
+
+        info = fingerprint_device(ip, ports)
+        audit_log("fingerprint", {"ip": ip, "brand_guess": info["brand_guess"]})
+
+        rtsp_result = check_rtsp_open(ip) if 554 in ports else None
+        info["rtsp_open"] = rtsp_result
+        audit_log("rtsp_check", {"ip": ip, "result": rtsp_result})
+
+        print("    [*] Checking known factory-default credentials (short list only)...")
+        creds_found = check_default_creds(ip, ports)
+        info["default_creds_found"] = creds_found
+        audit_log("credential_check", {"ip": ip, "creds_found": bool(creds_found)})
+
+        if creds_found:
+            print(f"    [!] Default credentials WORK: {creds_found}")
+        else:
+            print("    [-] No default credentials matched.")
+
+        matched_cves = match_cves(info["brand_guess"], cve_db)
+        info["matched_cves"] = matched_cves
+        if matched_cves:
+            print(f"    [!] {len(matched_cves)} known CVE(s) matched for {info['brand_guess']}")
+
+        risk_score = compute_risk_score(creds_found, rtsp_result, matched_cves)
+        info["risk_score"] = risk_score
+        label = risk_label(risk_score)
+        print(f"    [*] Risk score: {risk_score} ({label})")
+        audit_log("risk_scored", {"ip": ip, "score": risk_score, "label": label})
+
+        if bridge and risk_score > highest_score_seen:
+            highest_score_seen = risk_score
+            bridge.send_risk_alert(label)
+
+        # Log any physical proximity detected during this device's assessment
+        if bridge:
+            pir_events = bridge.poll_pir_events()
+            if pir_events:
+                audit_log("pir_motion_detected", {"ip": ip, "timestamps_ms": pir_events})
+                print(f"    [i] Motion detected near device during scan ({len(pir_events)} event(s))")
+
+        findings[ip] = info
+
+    generate_report(findings)
+
+    with open("sentrysec_findings.json", "w") as f:
+        json.dump(findings, f, indent=2)
+    print("[*] Raw findings saved to sentrysec_findings.json")
+
+    audit_log("report_generated", {"path": "sentrysec_report.html"})
+    audit_log("session_end")
+
+    if bridge:
+        bridge.send_status("Scan complete")
+        bridge.close()
+
+    verify_audit_log()
+
+
+if __name__ == "__main__":
+    main()
