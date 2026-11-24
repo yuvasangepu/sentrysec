@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""
+SentrySec - ESP32 Serial Listener
+=====================================
+Reads Wi-Fi scan results from the ESP32 over USB serial and flags
+networks that look like camera/DVR setup APs or are wide open (no auth).
+
+Usage:
+    python esp32_serial_listener.py COM5        (Windows)
+    python esp32_serial_listener.py /dev/ttyUSB0 (Linux)
+
+Requires: pip install pyserial
+"""
+
+import sys
+import serial
+import time
+
+# Common SSID patterns used by cheap IP cameras / DVR setup APs
+CAMERA_SSID_HINTS = [
+    "ipc", "ipcam", "dvr", "nvr", "hikvision", "dahua", "cam-",
+    "camera", "cp plus", "cpplus", "wificam", "smartcam"
+]
+
+
+def looks_like_camera(ssid):
+    s = ssid.lower()
+    return any(hint in s for hint in CAMERA_SSID_HINTS)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python esp32_serial_listener.py <serial_port>")
+        print("  e.g. python esp32_serial_listener.py COM5")
+        print("  e.g. python esp32_serial_listener.py /dev/ttyUSB0")
+        sys.exit(1)
+
+    port = sys.argv[1]
+    baud = 115200
+
+    print(f"[*] Connecting to ESP32 on {port} @ {baud} baud...")
+    try:
+        ser = serial.Serial(port, baud, timeout=2)
+    except serial.SerialException as e:
+        print(f"[!] Could not open port: {e}")
+        sys.exit(1)
+
+    time.sleep(2)
+    print("[*] Listening for Wi-Fi scan data... (Ctrl+C to stop)\n")
+
+    in_scan = False
+    results = []
+
+    try:
+        while True:
+            line = ser.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            if line == "---SCAN_START---":
+                in_scan = True
+                results = []
+                continue
+            if line == "---SCAN_END---":
+                in_scan = False
+                print(f"\n[*] Scan complete: {len(results)} networks found")
+                flagged = [r for r in results if r["flag"]]
+                if flagged:
+                    print("[!] Networks of interest:")
+                    for r in flagged:
+                        print(f"    {r['ssid']} | RSSI {r['rssi']} | {r['auth']}")
+                print("-" * 50)
+                continue
+
+            if in_scan and "," in line:
+                parts = line.split(",")
+                if len(parts) == 3:
+                    ssid, rssi, auth = parts
+                    flag = looks_like_camera(ssid) or auth == "OPEN"
+                    results.append({"ssid": ssid, "rssi": rssi, "auth": auth, "flag": flag})
+                    marker = " <-- possible camera/open network" if flag else ""
+                    print(f"    {ssid:<25} RSSI:{rssi:<6} AUTH:{auth}{marker}")
+
+    except KeyboardInterrupt:
+        print("\n[*] Stopped.")
+        ser.close()
+
+
+if __name__ == "__main__":
+    main()
