@@ -1,0 +1,157 @@
+/*
+  SentrySec - ESP32-CAM Advanced Module (Corrected Pins)
+  -----------------------------------------------------------
+  Pin plan corrected to match the AI-Thinker ESP32-CAM's actual
+  EXTERNALLY ACCESSIBLE header pins (GPIO21/22/25 are internal-only,
+  wired to the camera - not usable for external wiring).
+
+  Uses only pins broken out on the two side headers:
+    OLED SDA -> GPIO14   OLED SCL -> GPIO15
+    Buzzer   -> GPIO16
+    PIR OUT  -> GPIO13
+
+  U0R/U0T (GPIO3/GPIO1) are reserved for Serial communication with
+  the laptop via the FTDI programmer - do not reuse these for anything else.
+
+  Libraries needed (Arduino IDE Library Manager):
+    - Adafruit SSD1306
+    - Adafruit GFX
+
+  Serial protocol (from laptop):
+    "ALERT:CRITICAL" / "ALERT:HIGH" / "ALERT:MEDIUM" / "ALERT:LOW" / "ALERT:NONE"
+    "STATUS:<text>"
+
+  Serial output (to laptop):
+    Wi-Fi scan results (CSV: SSID,RSSI,AUTH)
+    "PIR_TRIGGERED,<timestamp_ms>"
+*/
+
+#include "WiFi.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#define OLED_SDA 14
+#define OLED_SCL 15
+#define BUZZER_PIN 16
+#define PIR_PIN 13
+
+String currentStatus = "Idle";
+String currentRisk = "NONE";
+bool pirBaseline = false;
+
+void applyRiskAlert(String risk) {
+  currentRisk = risk;
+  if (risk == "CRITICAL") {
+    for (int i = 0; i < 3; i++) { tone(BUZZER_PIN, 2000, 150); delay(250); }
+  } else if (risk == "HIGH") {
+    tone(BUZZER_PIN, 1500, 300);
+  } else if (risk == "MEDIUM") {
+    tone(BUZZER_PIN, 1000, 150);
+  }
+  updateDisplay();
+}
+
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("SentrySec");
+  display.println("----------------");
+  display.print("Status: ");
+  display.println(currentStatus);
+  display.print("Risk:   ");
+  display.println(currentRisk);
+  display.display();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(PIR_PIN, INPUT);
+
+  Wire.begin(OLED_SDA, OLED_SCL);  // custom I2C pins - required since default 21/22 aren't free
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed - check wiring/address");
+  }
+  updateDisplay();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  Serial.println("SentrySec ESP32-CAM Advanced Module Ready");
+}
+
+void checkSerialCommands() {
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+
+        currentStatus = cmd;      // Show the raw command on the OLED
+        updateDisplay();
+
+        if (cmd.startsWith("ALERT:")) {
+            applyRiskAlert(cmd.substring(6));
+        } else if (cmd.startsWith("STATUS:")) {
+            currentStatus = cmd.substring(7);
+            updateDisplay();
+        }
+    }
+}
+
+void checkPir() {
+  bool motion = digitalRead(PIR_PIN) == HIGH;
+  if (motion && !pirBaseline) {
+    Serial.print("PIR_TRIGGERED,");
+    Serial.println(millis());
+  }
+  pirBaseline = motion;
+}
+
+void wifiScan() {
+  currentStatus = "Scanning WiFi";
+  updateDisplay();
+  Serial.println("---SCAN_START---");
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    Serial.println("NO_NETWORKS_FOUND");
+  } else {
+    for (int i = 0; i < n; ++i) {
+      Serial.print(WiFi.SSID(i));
+      Serial.print(",");
+      Serial.print(WiFi.RSSI(i));
+      Serial.print(",");
+      switch (WiFi.encryptionType(i)) {
+        case WIFI_AUTH_OPEN:         Serial.println("OPEN"); break;
+        case WIFI_AUTH_WEP:          Serial.println("WEP"); break;
+        case WIFI_AUTH_WPA_PSK:      Serial.println("WPA_PSK"); break;
+        case WIFI_AUTH_WPA2_PSK:     Serial.println("WPA2_PSK"); break;
+        case WIFI_AUTH_WPA_WPA2_PSK: Serial.println("WPA_WPA2_PSK"); break;
+        default:                     Serial.println("OTHER"); break;
+      }
+    }
+  }
+  Serial.println("---SCAN_END---");
+  currentStatus = "Idle";
+  updateDisplay();
+}
+
+unsigned long lastScan = 0;
+
+void loop() {
+  checkSerialCommands();
+  checkPir();
+  if (millis() - lastScan > 15000) {
+    wifiScan();
+    lastScan = millis();
+  }
+  delay(50);
